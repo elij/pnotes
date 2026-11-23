@@ -1,7 +1,7 @@
 ;;; pnotes.el --- Project-bound note links, cache, and remember capture -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.0.01
+;; Version: 0.0.02
 ;; Package-Requires: ((emacs "31.0"))
 ;; Description: Scheme-free project-scoped note engine for Emacs
 
@@ -792,7 +792,8 @@ propagates `pnotes-mode', and emits a `follow' navigation event."
   "Return a Capf completion spec for SCHEME projected from ROOT's cache via ROW-FN.
 ROW-FN is called as (ROW-FN REL META CACHE) and returns an alist of
 (CANDIDATE . ANNOTATION) pairs."
-  (let ((ann-tbl (make-hash-table :test #'equal))
+  (let ((src-buf (current-buffer))
+        (ann-tbl (make-hash-table :test #'equal))
         (pfx (pnotes--stripped-prefix scheme prefix))
         (create-p (or (plist-get scheme :create-template)
                       (plist-get scheme :template))))
@@ -815,14 +816,16 @@ ROW-FN is called as (ROW-FN REL META CACHE) and returns an alist of
             :annotation-function (lambda (cand) (or (gethash cand ann-tbl) " [create]"))
             :exit-function
             (lambda (chosen status)
-              (when (memq status '(finished sole))
+              (when (and (eq (current-buffer) src-buf)
+                         (memq status '(finished sole)))
                 (pnotes--capf-close-and-maybe-follow
                  chosen (concat pfx chosen) close-str src-dir root
                  (gethash chosen ann-tbl))))))))
 
 (defun pnotes-complete-file-relative (scheme start end prefix close-str src-dir root)
   "Capf completer for relative or prefixed file SCHEME."
-  (let ((pfx (pnotes--stripped-prefix scheme prefix))
+  (let ((src-buf (current-buffer))
+        (pfx (pnotes--stripped-prefix scheme prefix))
         (exts (or (plist-get scheme :extensions) (pnotes--all-extensions))))
     (list (+ start (length pfx)) end #'completion-file-name-table
           :predicate (lambda (f)
@@ -832,7 +835,8 @@ ROW-FN is called as (ROW-FN REL META CACHE) and returns an alist of
           :exclusive 'no
           :exit-function
           (lambda (chosen status)
-            (when (memq status '(finished sole))
+            (when (and (eq (current-buffer) src-buf)
+                       (memq status '(finished sole)))
               (pnotes--capf-close-and-maybe-follow
                chosen (concat pfx chosen) close-str src-dir root nil))))))
 
