@@ -9,22 +9,49 @@
 ;;; Code:
 
 (require 'pnotes)
+(require 'color)
 (require 'face-remap)
 (require 'graph-fa2 nil t)
 
 (declare-function graph-fa2-start "graph-fa2" (buf nodes edges &key cache-dir))
 (declare-function graph-fa2-player-stop "graph-fa2" ())
+(declare-function graph-fa2-clear-cache "graph-fa2" (&optional cache-dir))
 (defvar graph-fa2-playback-buffer)
 (defvar graph-fa2-node-clicked-functions)
+(defvar graph-fa2-label-colour)
+(defvar graph-fa2-edge-colour)
+(defvar graph-fa2-edge-label-colour)
 
-(defcustom pnotes-graph-bg-color "#282c34"
-  "Background hex colour for the `pnotes-graph' buffer."
-  :type 'string
+(defface pnotes-graph-node
+  '((t :inherit pnotes-link))
+  "Face whose foreground supplies the default `pnotes-graph' node colour."
   :group 'pnotes)
 
-(defcustom pnotes-graph-node-color "#89b4fa"
-  "Default node fill colour for `pnotes-graph'."
-  :type 'string
+(defface pnotes-graph-edge
+  '((t :inherit shadow))
+  "Face whose foreground supplies the `pnotes-graph' edge stroke colour."
+  :group 'pnotes)
+
+(defface pnotes-graph-label
+  '((t :inherit default))
+  "Face whose foreground supplies the `pnotes-graph' node label colour."
+  :group 'pnotes)
+
+(defface pnotes-graph-edge-label
+  '((t :inherit shadow))
+  "Face whose foreground supplies the `pnotes-graph' edge label colour."
+  :group 'pnotes)
+
+(defcustom pnotes-graph-bg-color nil
+  "Optional background colour for the `pnotes-graph' buffer.
+When nil, inherit the active theme's `default' background."
+  :type '(choice (const :tag "Theme default" nil) color)
+  :group 'pnotes)
+
+(defcustom pnotes-graph-node-color nil
+  "Optional default node fill colour for `pnotes-graph'.
+When nil, derive the colour from the `pnotes-graph-node' face."
+  :type '(choice (const :tag "Theme default" nil) color)
   :group 'pnotes)
 
 (defcustom pnotes-graph-tag-groups nil
@@ -53,25 +80,54 @@ The first matching tag wins."
 (defvar-local pnotes-graph--bg-cookie nil
   "Face remapping cookie for `pnotes-graph-bg-color'.")
 
+(defvar pnotes-graph--theme-timer nil
+  "Pending timer to refresh live `pnotes-graph-mode' buffers after theme change.")
+
 (defun pnotes-graph--cache-dir (root)
   "Return a per-project cache directory for `graph-fa2-start' under ROOT."
   (let* ((repo (file-name-nondirectory (directory-file-name root)))
          (subdir (format "%s-%s" repo (substring (md5 root) 0 8))))
     (expand-file-name subdir pnotes-graph-cache-directory)))
 
-(defun pnotes-graph--node-colour (tags)
-  "Return the hex colour for a note with TAGS."
+(defun pnotes-graph--hex-colour (colour &optional fallback)
+  "Convert COLOUR to a `#RRGGBB' hex string, or return FALLBACK."
+  (if-let* (((stringp colour))
+            ((not (string-prefix-p "unspecified" colour)))
+            (rgb (color-name-to-rgb colour)))
+      (apply #'color-rgb-to-hex (append rgb '(2)))
+    fallback))
+
+(defun pnotes-graph--face-colour (face &optional fallback)
+  "Return the `#RRGGBB' foreground colour of FACE, or FALLBACK."
+  (pnotes-graph--hex-colour (face-foreground face nil t) fallback))
+
+(defun pnotes-graph--theme-colours ()
+  "Return plist of resolved hex colours for the active theme."
+  (list :node (or (pnotes-graph--hex-colour pnotes-graph-node-color)
+                  (pnotes-graph--face-colour 'pnotes-graph-node "#89b4fa"))
+        :edge (pnotes-graph--face-colour 'pnotes-graph-edge "#585b70")
+        :label (pnotes-graph--face-colour 'pnotes-graph-label "#cdd6f4")
+        :edge-label (pnotes-graph--face-colour 'pnotes-graph-edge-label "#a6adc8")))
+
+(defun pnotes-graph--node-colour (tags &optional default-colour)
+  "Return the hex colour for a note with TAGS, falling back to DEFAULT-COLOUR."
   (or (cl-some (lambda (pair)
                  (when (cl-member (car pair) tags :test #'string-equal-ignore-case)
-                   (cdr pair)))
+                   (pnotes-graph--hex-colour (cdr pair) (cdr pair))))
                pnotes-graph-tag-groups)
-      pnotes-graph-node-color))
+      default-colour
+      (pnotes-graph--hex-colour pnotes-graph-node-color)
+      (pnotes-graph--face-colour 'pnotes-graph-node "#89b4fa")))
 
-(defun pnotes-graph--prepare-data (cache &optional center-rel max-hops)
+(defun pnotes-graph--prepare-data (cache &optional center-rel max-hops colours)
   "Build `graph-fa2-start' payload (:nodes NODES :edges EDGES) from CACHE.
 Projects link key groups from cached `:links' tuples in `pnotes--cache-files'
-and derives node prominence from incoming graph edges."
-  (let* ((files-tbl (pnotes--cache-files cache))
+and derives node prominence from incoming graph edges.
+COLOURS is an optional plist from `pnotes-graph--theme-colours'."
+  (let* ((theme (or colours (pnotes-graph--theme-colours)))
+         (default-node-colour (plist-get theme :node))
+         (edge-colour (plist-get theme :edge))
+         (files-tbl (pnotes--cache-files cache))
          (edge-set (make-hash-table :test #'equal))
          (adj (make-hash-table :test #'equal))
          (in-deg (make-hash-table :test #'equal))
@@ -113,7 +169,8 @@ and derives node prominence from incoming graph edges."
     (dolist (rel (sort (hash-table-keys (or visited files-tbl)) #'string<))
       (let* ((meta (gethash rel files-tbl))
              (title (plist-get meta :title))
-             (colour (pnotes-graph--node-colour (plist-get meta :tags)))
+             (colour (pnotes-graph--node-colour (plist-get meta :tags)
+                                                default-node-colour))
              (radius (min 20.0 (+ 10.0 (* 2.0 (gethash rel in-deg 0))))))
         (push (list :id rel :colour colour :radius radius :label title) nodes)))
     (maphash (lambda (pair _v)
@@ -122,7 +179,10 @@ and derives node prominence from incoming graph edges."
                               (gethash (cdr pair) visited)))
                  (push pair edges)))
              edge-set)
-    (setq edges (sort edges #'value<))
+    (setq edges (mapcar (lambda (pair)
+                          (list :from (car pair) :to (cdr pair)
+                                :colour edge-colour))
+                        (sort edges #'value<)))
     (list :nodes (nreverse nodes) :edges edges)))
 
 (defun pnotes-graph--on-node-clicked (node-id)
@@ -140,11 +200,66 @@ and derives node prominence from incoming graph edges."
          (pnotes--open-note r file 'follow))
        main-win root target-file))))
 
+(defun pnotes-graph--apply-bg-remap ()
+  "Apply or remove `pnotes-graph-bg-color' face remapping in current buffer."
+  (when pnotes-graph--bg-cookie
+    (face-remap-remove-relative pnotes-graph--bg-cookie)
+    (setq-local pnotes-graph--bg-cookie nil))
+  (when pnotes-graph-bg-color
+    (setq-local pnotes-graph--bg-cookie
+                (face-remap-add-relative 'default :background pnotes-graph-bg-color))))
+
+(defun pnotes-graph--ensure-theme-cache (cache-dir colours)
+  "Clear stale `graph-fa2' cache in CACHE-DIR when COLOURS have changed."
+  (let* ((stamp-file (expand-file-name "pnotes-theme.stamp" cache-dir))
+         (sig (prin1-to-string colours))
+         (prev (when (file-exists-p stamp-file)
+                 (with-temp-buffer
+                   (insert-file-contents stamp-file)
+                   (buffer-string)))))
+    (unless (equal prev sig)
+      (when (file-exists-p cache-dir)
+        (graph-fa2-clear-cache cache-dir))
+      (make-directory cache-dir t)
+      (with-temp-file stamp-file
+        (insert sig)))))
+
+(defun pnotes-graph--refresh-open-buffers ()
+  "Re-apply theme colours and relaunch all live `pnotes-graph-mode' buffers."
+  (setq pnotes-graph--theme-timer nil)
+  (dolist (buf (buffer-list))
+    (when (buffer-local-value 'pnotes-graph-mode buf)
+      (with-current-buffer buf
+        (pnotes-graph--apply-bg-remap)
+        (pnotes-graph--launch buf)))))
+
+(defun pnotes-graph--on-theme-change (&optional _theme)
+  "Schedule a debounced theme refresh for live `pnotes-graph-mode' buffers."
+  (when (cl-some (lambda (b) (buffer-local-value 'pnotes-graph-mode b))
+                 (buffer-list))
+    (when (timerp pnotes-graph--theme-timer)
+      (cancel-timer pnotes-graph--theme-timer))
+    (setq pnotes-graph--theme-timer
+          (run-at-time 0 nil #'pnotes-graph--refresh-open-buffers))))
+
+(defun pnotes-graph--maybe-unhook-theme ()
+  "Remove theme hooks when no other `pnotes-graph-mode' buffers remain."
+  (unless (cl-some (lambda (b)
+                     (and (not (eq b (current-buffer)))
+                          (buffer-local-value 'pnotes-graph-mode b)))
+                   (buffer-list))
+    (when (timerp pnotes-graph--theme-timer)
+      (cancel-timer pnotes-graph--theme-timer)
+      (setq pnotes-graph--theme-timer nil))
+    (remove-hook 'enable-theme-functions #'pnotes-graph--on-theme-change)
+    (remove-hook 'disable-theme-functions #'pnotes-graph--on-theme-change)))
+
 (defun pnotes-graph--cleanup ()
-  "Stop `graph-fa2' playback and kill its playback buffer."
+  "Stop `graph-fa2' playback, kill its playback buffer, and unhook theme sync."
   (graph-fa2-player-stop)
   (when (buffer-live-p graph-fa2-playback-buffer)
-    (kill-buffer graph-fa2-playback-buffer)))
+    (kill-buffer graph-fa2-playback-buffer))
+  (pnotes-graph--maybe-unhook-theme))
 
 (defun pnotes-graph--stop-active-players ()
   "Stop active `graph-fa2' playback in all `pnotes-graph-mode' buffers."
@@ -159,20 +274,33 @@ and derives node prominence from incoming graph edges."
   (with-current-buffer buf
     (let* ((root (pnotes-project-root))
            (cache (pnotes--ensure-cache root))
-           (data (pnotes-graph--prepare-data cache pnotes-graph--center pnotes-graph--max-hops))
+           (colours (pnotes-graph--theme-colours))
+           (data (pnotes-graph--prepare-data
+                  cache pnotes-graph--center pnotes-graph--max-hops colours))
            (cache-dir (pnotes-graph--cache-dir root)))
+      (setq graph-fa2-label-colour (plist-get colours :label)
+            graph-fa2-edge-colour (plist-get colours :edge)
+            graph-fa2-edge-label-colour (plist-get colours :edge-label))
+      (pnotes-graph--ensure-theme-cache cache-dir colours)
       (graph-fa2-start buf (plist-get data :nodes) (plist-get data :edges)
                        :cache-dir cache-dir))))
 
 (defun pnotes-graph-refresh ()
   "Reconcile the project cache and restart the `graph-fa2' simulation."
+  (declare (modes pnotes-graph-mode))
   (interactive)
+  (unless pnotes-graph-mode
+    (user-error "Not in a `pnotes-graph' buffer"))
   (pnotes-cache-reconcile (pnotes--require-root))
+  (pnotes-graph--apply-bg-remap)
   (pnotes-graph--launch (current-buffer)))
 
 (defun pnotes-graph-close ()
   "Close the `pnotes-graph' side window and kill its buffer."
+  (declare (modes pnotes-graph-mode))
   (interactive)
+  (unless pnotes-graph-mode
+    (user-error "Not in a `pnotes-graph' buffer"))
   (let ((buf (current-buffer)))
     (dolist (win (get-buffer-window-list buf nil t))
       (unless (one-window-p t (window-frame win))
@@ -203,12 +331,11 @@ and derives node prominence from incoming graph edges."
         (when-let* ((win (get-buffer-window (current-buffer) t)))
           (set-window-margins win 0 0)
           (set-window-fringes win 0 0))
-        (when pnotes-graph--bg-cookie
-          (face-remap-remove-relative pnotes-graph--bg-cookie))
-        (setq-local pnotes-graph--bg-cookie
-                    (face-remap-add-relative 'default :background pnotes-graph-bg-color))
+        (pnotes-graph--apply-bg-remap)
         (add-hook 'kill-buffer-hook #'pnotes-graph--cleanup nil t)
-        (add-hook 'graph-fa2-node-clicked-functions #'pnotes-graph--on-node-clicked nil t))
+        (add-hook 'graph-fa2-node-clicked-functions #'pnotes-graph--on-node-clicked nil t)
+        (add-hook 'enable-theme-functions #'pnotes-graph--on-theme-change)
+        (add-hook 'disable-theme-functions #'pnotes-graph--on-theme-change))
     (when pnotes-graph--bg-cookie
       (face-remap-remove-relative pnotes-graph--bg-cookie)
       (setq-local pnotes-graph--bg-cookie nil))
@@ -217,7 +344,8 @@ and derives node prominence from incoming graph edges."
                                left-fringe-width right-fringe-width))
       (kill-local-variable var))
     (remove-hook 'kill-buffer-hook #'pnotes-graph--cleanup t)
-    (remove-hook 'graph-fa2-node-clicked-functions #'pnotes-graph--on-node-clicked t)))
+    (remove-hook 'graph-fa2-node-clicked-functions #'pnotes-graph--on-node-clicked t)
+    (pnotes-graph--maybe-unhook-theme)))
 
 ;;;###autoload
 (defun pnotes-graph (&optional max-distance)
