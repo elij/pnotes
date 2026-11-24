@@ -47,6 +47,8 @@
 (define-derived-mode pnotes-view-mode tabulated-list-mode "PNotes-View"
   "Generic tabulated view mode for `pnotes' projections."
   (setq tabulated-list-padding 2)
+  (when (pnotes-project-root)
+    (pnotes-mode 1))
   (add-hook 'kill-buffer-hook #'pnotes-ui--unsubscribe nil t)
   (add-hook 'change-major-mode-hook #'pnotes-ui--unsubscribe nil t))
 
@@ -56,9 +58,9 @@
   (let* ((repo (file-name-nondirectory (directory-file-name root)))
          (buf (get-buffer-create (format "*%s: %s*" name repo))))
     (with-current-buffer buf
+      (setq-local default-directory root)
       (pnotes-view-mode)
-      (setq-local default-directory root
-                  tabulated-list-format format
+      (setq-local tabulated-list-format format
                   tabulated-list-sort-key sort-key
                   tabulated-list-entries entries-fn
                   pnotes-ui--action-fn action-fn)
@@ -146,7 +148,6 @@
      #'call-interactively
      nil t
      (lambda ()
-       (unless pnotes-mode (pnotes-mode 1))
        (when-let* ((proj-root (pnotes-project-root)))
          (let* ((cache (pnotes--ensure-cache proj-root))
                 (repo (file-name-nondirectory (directory-file-name proj-root)))

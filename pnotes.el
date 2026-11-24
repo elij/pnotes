@@ -1,7 +1,7 @@
 ;;; pnotes.el --- Project-bound note links, cache, and remember capture -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.0.03
+;; Version: 0.0.04
 ;; Package-Requires: ((emacs "31.0"))
 ;; Description: Scheme-free project-scoped note engine for Emacs
 
