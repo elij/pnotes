@@ -374,12 +374,18 @@ When PNOTES-ONLY is non-nil, require a PNotes Speedbar display mode."
                        speedbar-last-selected-file))
           (make-local-variable var))
         (setq-local speedbar-buffer buf
-                    pnotes-speedbar--expanded (make-hash-table :test #'equal)))
+                    pnotes-speedbar--expanded (make-hash-table :test #'equal)
+                    pnotes-current-file-function
+                    (lambda ()
+                      (and (string= speedbar-initial-expansion-list-name "PNotes Overview")
+                           (when-let* ((b (pnotes-speedbar--active-buffer)))
+                             (buffer-file-name b))))))
       (unless (equal root pnotes-speedbar--project-root)
         (setq-local default-directory root
                     pnotes-speedbar--project-root root
                     speedbar-shown-directories nil
                     speedbar-full-text-cache nil))
+      (unless pnotes-mode (pnotes-mode 1))
       (add-hook 'pnotes-navigation-hook #'pnotes-speedbar--on-navigation)
       (add-hook 'kill-buffer-hook #'pnotes-speedbar--unsubscribe nil t))
     (unless (pnotes-speedbar--visible-p)

@@ -81,6 +81,7 @@
       (tabulated-list-init-header)
       (tabulated-list-print t)
       (goto-char (point-min)))
+    (when same-window-p (pnotes--ensure-main-window))
     (if same-window-p (pop-to-buffer-same-window buf) (pop-to-buffer buf))))
 
 ;;; Inbox triage and welcome projections

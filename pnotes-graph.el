@@ -16,11 +16,20 @@
 (declare-function graph-fa2-start "graph-fa2" (buf nodes edges &key cache-dir))
 (declare-function graph-fa2-player-stop "graph-fa2" ())
 (declare-function graph-fa2-clear-cache "graph-fa2" (&optional cache-dir))
+(declare-function graph-fa2-ctx-bg-timer "graph-fa2" (cl-x))
+(defvar graph-fa2-ctx)
 (defvar graph-fa2-playback-buffer)
 (defvar graph-fa2-node-clicked-functions)
+(defvar graph-fa2-after-render-functions)
 (defvar graph-fa2-label-colour)
 (defvar graph-fa2-edge-colour)
 (defvar graph-fa2-edge-label-colour)
+(defvar graph-fa2--scale)
+(defvar graph-fa2--pan-x)
+(defvar graph-fa2--pan-y)
+(defvar graph-fa2--nav-state)
+(defvar graph-fa2--drag-context)
+(defvar graph-fa2-hovered-node)
 
 (defface pnotes-graph-node
   '((t :inherit pnotes-link))
@@ -83,10 +92,11 @@ The first matching tag wins."
 (defvar pnotes-graph--theme-timer nil
   "Pending timer to refresh live `pnotes-graph-mode' buffers after theme change.")
 
-(defun pnotes-graph--cache-dir (root)
-  "Return a per-project cache directory for `graph-fa2-start' under ROOT."
+(defun pnotes-graph--cache-dir (root &optional center max-hops)
+  "Return a cache directory for `graph-fa2-start' under ROOT and scope."
   (let* ((repo (file-name-nondirectory (directory-file-name root)))
-         (subdir (format "%s-%s" repo (substring (md5 root) 0 8))))
+         (key (format "%s:%s:%s" root center max-hops))
+         (subdir (format "%s-%s" repo (substring (md5 key) 0 8))))
     (expand-file-name subdir pnotes-graph-cache-directory)))
 
 (defun pnotes-graph--hex-colour (colour &optional fallback)
@@ -254,19 +264,31 @@ COLOURS is an optional plist from `pnotes-graph--theme-colours'."
     (remove-hook 'enable-theme-functions #'pnotes-graph--on-theme-change)
     (remove-hook 'disable-theme-functions #'pnotes-graph--on-theme-change)))
 
+(defun pnotes-graph--stop-player ()
+  "Stop `graph-fa2' playback and any active background worker in current buffer."
+  (graph-fa2-player-stop)
+  (when-let* ((tmr (and graph-fa2-ctx (graph-fa2-ctx-bg-timer graph-fa2-ctx))))
+    (cancel-timer tmr)))
+
 (defun pnotes-graph--cleanup ()
   "Stop `graph-fa2' playback, kill its playback buffer, and unhook theme sync."
-  (graph-fa2-player-stop)
+  (pnotes-graph--stop-player)
   (when (buffer-live-p graph-fa2-playback-buffer)
     (kill-buffer graph-fa2-playback-buffer))
   (pnotes-graph--maybe-unhook-theme))
 
+(defun pnotes-graph--after-render ()
+  "Force repaint of non-selected `pnotes-graph' windows after rendering."
+  (when-let* ((win (get-buffer-window (current-buffer) t))
+              ((not (eq win (selected-window)))))
+    (force-window-update win)))
+
 (defun pnotes-graph--stop-active-players ()
-  "Stop active `graph-fa2' playback in all `pnotes-graph-mode' buffers."
+  "Stop active `graph-fa2' playback and background workers in graph buffers."
   (dolist (buf (buffer-list))
     (when (buffer-local-value 'pnotes-graph-mode buf)
       (with-current-buffer buf
-        (graph-fa2-player-stop)))))
+        (pnotes-graph--stop-player)))))
 
 (defun pnotes-graph--launch (buf)
   "Populate and start `graph-fa2' simulation in graph buffer BUF."
@@ -274,10 +296,22 @@ COLOURS is an optional plist from `pnotes-graph--theme-colours'."
   (with-current-buffer buf
     (let* ((root (pnotes-project-root))
            (cache (pnotes--ensure-cache root))
+           (local-p (and (integerp pnotes-graph--max-hops)
+                         (> pnotes-graph--max-hops 0)
+                         pnotes-graph--center
+                         (gethash pnotes-graph--center (pnotes--cache-files cache))))
+           (center (and local-p pnotes-graph--center))
+           (hops (and local-p pnotes-graph--max-hops))
            (colours (pnotes-graph--theme-colours))
-           (data (pnotes-graph--prepare-data
-                  cache pnotes-graph--center pnotes-graph--max-hops colours))
-           (cache-dir (pnotes-graph--cache-dir root)))
+           (data (pnotes-graph--prepare-data cache center hops colours))
+           (cache-dir (pnotes-graph--cache-dir root center hops)))
+      (mapc #'delete-overlay (overlays-in (point-min) (point-max)))
+      (setq-local graph-fa2--scale 1.0
+                  graph-fa2--pan-x 0.0
+                  graph-fa2--pan-y 0.0
+                  graph-fa2--nav-state 'idle
+                  graph-fa2--drag-context nil
+                  graph-fa2-hovered-node nil)
       (setq graph-fa2-label-colour (plist-get colours :label)
             graph-fa2-edge-colour (plist-get colours :edge)
             graph-fa2-edge-label-colour (plist-get colours :edge-label))
@@ -322,29 +356,27 @@ COLOURS is an optional plist from `pnotes-graph--theme-colours'."
       (progn
         (setq-local cursor-type nil
                     bidi-display-reordering nil
-                    track-mouse 'all
                     display-line-numbers nil
                     left-margin-width 0
                     right-margin-width 0
                     left-fringe-width 0
                     right-fringe-width 0)
-        (when-let* ((win (get-buffer-window (current-buffer) t)))
-          (set-window-margins win 0 0)
-          (set-window-fringes win 0 0))
         (pnotes-graph--apply-bg-remap)
         (add-hook 'kill-buffer-hook #'pnotes-graph--cleanup nil t)
         (add-hook 'graph-fa2-node-clicked-functions #'pnotes-graph--on-node-clicked nil t)
+        (add-hook 'graph-fa2-after-render-functions #'pnotes-graph--after-render nil t)
         (add-hook 'enable-theme-functions #'pnotes-graph--on-theme-change)
         (add-hook 'disable-theme-functions #'pnotes-graph--on-theme-change))
     (when pnotes-graph--bg-cookie
       (face-remap-remove-relative pnotes-graph--bg-cookie)
       (setq-local pnotes-graph--bg-cookie nil))
-    (dolist (var '(track-mouse cursor-type bidi-display-reordering
+    (dolist (var '(cursor-type bidi-display-reordering
                                display-line-numbers left-margin-width right-margin-width
                                left-fringe-width right-fringe-width))
       (kill-local-variable var))
     (remove-hook 'kill-buffer-hook #'pnotes-graph--cleanup t)
     (remove-hook 'graph-fa2-node-clicked-functions #'pnotes-graph--on-node-clicked t)
+    (remove-hook 'graph-fa2-after-render-functions #'pnotes-graph--after-render t)
     (pnotes-graph--maybe-unhook-theme)))
 
 ;;;###autoload
@@ -356,7 +388,7 @@ MAX-DISTANCE hops from the current note.  A prefix of 0 forces a full graph."
   (unless (or (featurep 'graph-fa2) (require 'graph-fa2 nil t))
     (user-error "Package `graph-fa2' is not available"))
   (let* ((root (pnotes--require-root))
-         (file (buffer-file-name))
+         (file (pnotes--current-file))
          (center-rel (and file (pnotes--rel-path file root)))
          (max-hops (if (null max-distance)
                        pnotes-graph-max-distance
@@ -376,8 +408,10 @@ MAX-DISTANCE hops from the current note.  A prefix of 0 forces a full graph."
                   (window-parameters . ((no-other-window . nil)
                                         (no-delete-other-windows . t)))))))
       (with-current-buffer buf
-        (pnotes-graph-mode 1))
+        (unless pnotes-graph-mode (pnotes-graph-mode 1)))
       (when (window-live-p win)
+        (set-window-margins win 0 0)
+        (set-window-fringes win 0 0)
         (window-preserve-size win t t)
         (set-window-dedicated-p win t)))
     (pnotes-graph--launch buf)

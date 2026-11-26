@@ -1,7 +1,7 @@
 ;;; pnotes.el --- Project-bound note links, cache, and remember capture -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.0.04
+;; Version: 0.0.05
 ;; Package-Requires: ((emacs "31.0"))
 ;; Description: Scheme-free project-scoped note engine for Emacs
 
@@ -30,9 +30,16 @@
 (autoload 'pnotes-graph "pnotes-graph" nil t)
 
 (declare-function consult-ripgrep "consult" (&optional dir initial))
+(declare-function consult-grep "consult" (&optional dir initial))
+(declare-function consult--read "consult" (candidates &rest options))
+(declare-function consult--file-preview "consult" ())
+(declare-function consult-xref "consult-xref" (fetcher &optional alist))
 (defvar consult-ripgrep-args)
+(defvar consult-grep-args)
 (defvar consult-async-split-style)
 (defvar pnotes-mode)
+(defvar-local pnotes-current-file-function nil
+  "Optional 0-arg function returning the active note path for this buffer.")
 
 ;;; Customisation, default schemes, and mode adapters
 
@@ -294,6 +301,12 @@ Avoids `file-in-directory-p' so uncreated files in new subdirectories work."
         (exp-root (file-name-as-directory (expand-file-name root))))
     (when (string-prefix-p exp-root expanded)
       (file-relative-name expanded exp-root))))
+
+(defun pnotes--current-file ()
+  "Return the active note file path for the current buffer, or nil."
+  (or (buffer-file-name)
+      (and (functionp pnotes-current-file-function)
+           (funcall pnotes-current-file-function))))
 
 (defun pnotes--main-window (&optional exclude-win frame)
   "Return a primary non-side window on FRAME, avoiding EXCLUDE-WIN."
@@ -750,9 +763,15 @@ When EVENT is non-nil, emit EVENT via `pnotes--emit'."
       (when event (pnotes--emit root file event))))
   buf)
 
+(defun pnotes--ensure-main-window ()
+  "Select a primary non-side window when the selected window is a side window."
+  (when (window-parameter (selected-window) 'window-side)
+    (select-window (pnotes--main-window (selected-window)))))
+
 (defun pnotes--open-note (root abs-path &optional event)
   "Visit ABS-PATH inside ROOT, propagating `pnotes-mode'.
 When EVENT is non-nil, emit EVENT via `pnotes--emit'.  Return the buffer."
+  (pnotes--ensure-main-window)
   (pnotes--activate-buffer (find-file abs-path) root event))
 
 (defun pnotes-follow (raw-target)
@@ -987,15 +1006,23 @@ When EXCLUDE-REL is non-nil, omit EXCLUDE-REL from the result."
          identifier)
      default-directory)))
 
+(defun pnotes--show-xrefs (root fetcher)
+  "Display FETCHER xrefs under ROOT, using `consult-xref' when available."
+  (let ((default-directory root)
+        (xref-show-xrefs-function
+         (if (require 'consult-xref nil t)
+             #'consult-xref
+           xref-show-xrefs-function)))
+    (xref-show-xrefs fetcher nil)))
+
 ;;;###autoload
 (defun pnotes-backlinks ()
   "Show backlinks to the current project note in an `xref' buffer."
   (interactive)
-  (if-let* ((file (buffer-file-name))
+  (if-let* ((file (pnotes--current-file))
             (root (pnotes-project-root))
             (rel (pnotes--rel-path file root)))
-      (let ((default-directory root))
-        (xref-show-xrefs (lambda () (pnotes--backlinks-for-file root rel)) nil))
+      (pnotes--show-xrefs root (lambda () (pnotes--backlinks-for-file root rel)))
     (user-error "Current buffer is not visiting a managed project note")))
 
 ;;;###autoload
@@ -1006,19 +1033,32 @@ When EXCLUDE-REL is non-nil, omit EXCLUDE-REL from the result."
          (files-tbl (pnotes--cache-files (pnotes--ensure-cache root)))
          (cands (or (sort (hash-table-keys files-tbl) #'string<)
                     (user-error "No notes found in %s" (abbreviate-file-name root))))
-         (completion-extra-properties
-          (list :annotation-function
-                (lambda (cand)
-                  (let* ((meta (gethash cand files-tbl))
-                         (title (plist-get meta :title))
-                         (stem (file-name-sans-extension (file-name-nondirectory cand)))
-                         (parts (append (unless (string= title stem) (list title))
-                                        (mapcar (lambda (tg) (concat "#" tg))
-                                                (plist-get meta :tags)))))
-                    (when parts
-                      (propertize (concat "  " (string-join parts "  "))
-                                  'face 'completions-annotations))))))
-         (choice (completing-read "Note: " cands nil t)))
+         (annotate
+          (lambda (cand)
+            (let* ((meta (gethash cand files-tbl))
+                   (title (plist-get meta :title))
+                   (stem (file-name-sans-extension (file-name-nondirectory cand)))
+                   (parts (append (unless (string= title stem) (list title))
+                                  (mapcar (lambda (tg) (concat "#" tg))
+                                          (plist-get meta :tags)))))
+              (when parts
+                (propertize (concat "  " (string-join parts "  "))
+                            'face 'completions-annotations)))))
+         (default-directory root)
+         (choice
+          (if (require 'consult nil t)
+              (progn
+                (pnotes--ensure-main-window)
+                (consult--read cands
+                               :prompt "Note: "
+                               :category 'file
+                               :require-match t
+                               :sort nil
+                               :annotate annotate
+                               :state (consult--file-preview)))
+            (let ((completion-extra-properties
+                   (list :category 'file :annotation-function annotate)))
+              (completing-read "Note: " cands nil t)))))
     (pnotes--open-note root (expand-file-name choice root) 'follow)))
 
 ;;; Daily notes
@@ -1045,39 +1085,51 @@ When EXCLUDE-REL is non-nil, omit EXCLUDE-REL from the result."
 
 ;;; Project search and tag search
 
+(defun pnotes--append-args (base extra)
+  "Append EXTRA flag strings to BASE (list or space-separated string)."
+  (if (listp base)
+      (append base extra)
+    (string-join (cons base extra) " ")))
+
 (defun pnotes--grep (root regexp &optional initial-consult-regexp)
-  "Search managed notes under ROOT via `consult-ripgrep' or `xref'.
-REGEXP is passed to `xref-matches-in-files' when `consult-ripgrep' is
-unavailable.  INITIAL-CONSULT-REGEXP (falling back to REGEXP) supplies the
-initial input to `consult-ripgrep'."
-  (if (fboundp 'consult-ripgrep)
-      (progn
-        (require 'consult nil t)
-        (let* ((globs (mapcar (lambda (ext) (format "--glob=*.%s" ext))
-                              (pnotes--all-extensions)))
-               (consult-ripgrep-args
-                (if (listp consult-ripgrep-args)
-                    (append consult-ripgrep-args globs)
-                  (string-join (cons consult-ripgrep-args globs) " "))))
-          (consult-ripgrep root (or initial-consult-regexp regexp))
-          (pnotes--activate-buffer (window-buffer (selected-window)) root 'follow)))
-    (let ((default-directory root)
-          (re (or regexp (read-regexp "Search notes: " initial-consult-regexp))))
-      (xref-show-xrefs
-       (lambda ()
-         (if-let* ((files (pnotes--project-note-files root))
-                   (xrefs (xref-matches-in-files re files)))
-             (dolist (item xrefs xrefs)
-               (let ((loc (xref-item-location item)))
-                 (when (xref-file-location-p loc)
-                   (setf (xref-item-location item)
-                         (pnotes-make-xref-location
-                          (xref-file-location-file loc)
-                          (xref-file-location-line loc)
-                          (xref-file-location-column loc)
-                          root)))))
-           (user-error "No matches for: %s" re)))
-       nil))))
+  "Search managed notes under ROOT via `consult-ripgrep', `consult-grep', or `xref'.
+REGEXP is passed to `xref-matches-in-files' when neither `consult-ripgrep' nor
+`consult-grep' can run.  INITIAL-CONSULT-REGEXP (falling back to REGEXP)
+supplies the initial input to `consult'."
+  (let* ((consult-p (require 'consult nil t))
+         (exts (pnotes--all-extensions))
+         (glob-args (lambda (fmt) (mapcar (lambda (e) (format fmt e)) exts)))
+         (run-consult
+          (lambda (fn)
+            (pnotes--ensure-main-window)
+            (funcall fn root (or initial-consult-regexp regexp))
+            (pnotes--activate-buffer (window-buffer (selected-window)) root 'follow))))
+    (cond
+     ((and consult-p (executable-find "rg"))
+      (let ((consult-ripgrep-args
+             (pnotes--append-args consult-ripgrep-args (funcall glob-args "--glob=*.%s"))))
+        (funcall run-consult #'consult-ripgrep)))
+     ((and consult-p (executable-find "grep"))
+      (let ((consult-grep-args
+             (pnotes--append-args consult-grep-args (funcall glob-args "--include=*.%s"))))
+        (funcall run-consult #'consult-grep)))
+     (t
+      (let ((re (or regexp (read-regexp "Search notes: " initial-consult-regexp))))
+        (pnotes--show-xrefs
+         root
+         (lambda ()
+           (if-let* ((files (pnotes--project-note-files root))
+                     (xrefs (xref-matches-in-files re files)))
+               (dolist (item xrefs xrefs)
+                 (let ((loc (xref-item-location item)))
+                   (when (xref-file-location-p loc)
+                     (setf (xref-item-location item)
+                           (pnotes-make-xref-location
+                            (xref-file-location-file loc)
+                            (xref-file-location-line loc)
+                            (xref-file-location-column loc)
+                            root)))))
+             (user-error "No matches for: %s" re)))))))))
 
 ;;;###autoload
 (defun pnotes-search (&optional initial)
@@ -1153,7 +1205,7 @@ ROOT-OVERRIDE, when non-nil, overrides `(pnotes-project-root)'."
                       #'pnotes-adapter-wiki-format-link))
          (annotation
           (when-let* ((pnotes-capture-annotate)
-                      (src-file (buffer-file-name))
+                      (src-file (pnotes--current-file))
                       (src-rel (pnotes--rel-path src-file root)))
             (let ((meta (gethash src-rel (pnotes--cache-files (pnotes--ensure-cache root)))))
               (funcall wrap-fn
@@ -1236,8 +1288,8 @@ ROOT-OVERRIDE, when non-nil, overrides `(pnotes-project-root)'."
   "Core buffer-local hooks managed by `pnotes-mode'.")
 
 (defun pnotes--file-binding-filter (cmd)
-  "Return CMD only when the current buffer visits a file."
-  (when (buffer-file-name) cmd))
+  "Return CMD only when the current buffer has an active note file."
+  (when (pnotes--current-file) cmd))
 
 (defvar-keymap pnotes-command-map
   :doc "Prefix keymap for `pnotes' commands."
